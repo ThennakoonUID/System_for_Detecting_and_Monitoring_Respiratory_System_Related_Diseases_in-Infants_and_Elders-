@@ -14,7 +14,7 @@ Chronic Respiratory Diseases account for 12% of mortality in South Asia. Current
 * **Emergency Alert System:** Triggers automated SMS alerts alongside real-time visual and audio warnings for necessary medical personnel or caretakers during critical events.
 
 ## Hardware Architecture
-* **Microcontroller:** Low-cost ESP32 or Arduino-based processing unit.
+* **Microcontroller:** Low-cost ESP32-based processing unit.
 * **Sensors:** High-sensitivity pulse oximetry module, heart-rate module, temperature sensor, and accelerometer.
 * **Power Supply:** Rechargeable Li-Po battery system.
 * **Form Factor:** Compact, battery-powered wearable wristband and chest strap ensuring patient comfort and ease of use.
