@@ -25,3 +25,12 @@ Chronic Respiratory Diseases account for 12% of mortality in South Asia. Current
 * Pitiduwa S.M. (240518K)
 * Tennekone A.D.T.M.S.H. (240642J)
 * Wanninayaka W.M.I.R. (240695X)
+
+## Hardware Architecture
+* **Microcontroller:** Low-cost ESP32 or Arduino-based processing unit.
+* **Sensors:** High-sensitivity pulse oximetry module, heart-rate module, temperature sensor, and accelerometer.
+* **Power Supply:** Rechargeable Li-Po battery system.
+* **Form Factor:** Compact, battery-powered wearable wristband and chest strap ensuring patient comfort and ease of use.
+
+**Hardware Design Files:** [Click here to view and download the PCB design files from Google Drive](https://drive.google.com/drive/folders/1s421oYCiyX-rzGPese11IfVK0uFknzDo?usp=drive_link)
+
