@@ -6,3 +6,15 @@
 Thumbs.db
 Desktop.ini
 .DS_Store
+
+# Altium Designer Ignored Files
+History/
+__Previews/
+Project Logs*/
+Project Outputs*/
+*.SchDocPreview
+*.PcbDocPreview
+*.PrjPcbStructure
+*.OutJobPreview
+*.HarnessLog
+*.~*
