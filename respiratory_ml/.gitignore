@@ -1,0 +1,12 @@
+venv/
+firebase_key.json
+__pycache__/
+*.pyc
+*.pyo
+.ipynb_checkpoints/
+.DS_Store
+data/bidmc_*.csv
+data/bidmc_*.txt
+!data/features.csv
+!data/respiratory_risk_model.pkl
+!data/model_metadata.json
