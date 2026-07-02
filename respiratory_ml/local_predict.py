@@ -17,25 +17,36 @@ Firebase tree this script reads from:
     gender:     "Male" / "Female" / other, entered via web dashboard
     name:       patient name, entered via web dashboard
 
-Prediction output is written to:
-  prediction/   (top-level node, written after every manual ENTER)
+Firebase tree this script writes to:
+  biomedical_data/spo2, biomedical_data/bpm, respiratory_data/rate
+    — when a sensor is disconnected, a fake placeholder value is
+      written here so the dashboard's normal number displays keep
+      updating. This is intentional so the dashboard doesn't show
+      "no data" — see device_status/ below for the honest record.
+  device_status/
+    spo2_simulated, rr_simulated, bpm_simulated (bool)
+      — quiet flags, not displayed unless a dashboard is built to
+        show them. This is where the truth about real vs simulated
+        data lives for anyone who wants to check.
+  prediction/
+    — written after every manual ENTER. Includes has_fake_data,
+      fake_sensors, and per-sensor _source fields with full detail.
 
 How it works:
-  - Listens to all three sensor paths AND the user_profile path in real time
+  - Listens to all three sensor paths AND user_profile in real time
   - Builds a 5-minute rolling buffer on your Mac for each sensor signal
-  - If a sensor stops updating (ESP32 disconnected), fake placeholder
-    values are injected automatically, clearly labeled
-  - If no real sensor data arrives within FALLBACK_DELAY_SECONDS of
-    startup, fake placeholders kick in for all missing sensors
-  - Patient age/gender are read live from Firebase user_profile.
-    If missing, fallback demographic values are used and the
-    prediction result is flagged with profile_is_fallback = true
+  - If a sensor stops updating (ESP32 disconnected), a fake placeholder
+    value is generated AND written to the real Firebase sensor path,
+    so the dashboard continues showing numbers normally
+  - An "echo guard" prevents the script's own fake writes from being
+    misread as real ESP32 data by its own listener
+  - device_status/ records which sensors are currently simulated —
+    not shown anywhere unless a dashboard is built to display it
   - Press ENTER at any time to run a prediction once 60s of data exists
   - Ctrl+C to quit
 
 Important: This script must stay running continuously to maintain
-the 5-minute window. Closing it clears all buffers (profile data
-is re-fetched fresh from Firebase on next startup).
+the 5-minute window. Closing it clears all buffers.
 ─────────────────────────────────────────────────────────────────
 """
 
@@ -65,7 +76,8 @@ BPM_PATH     = "biomedical_data/bpm"
 RR_PATH      = "respiratory_data/rate"
 PROFILE_PATH = "user_profile"
 
-PREDICTION_PATH = "prediction"
+PREDICTION_PATH    = "prediction"
+DEVICE_STATUS_PATH = "device_status"   # quiet real/simulated flags
 
 FALLBACK_AGE    = 25
 FALLBACK_GENDER = 1   # 1 = Male, 0 = Female, -1 = Unknown
@@ -79,6 +91,12 @@ FALLBACK_DELAY_SECONDS = 15
 FAKE_SPO2 = 97.0
 FAKE_RR   = 16.0
 FAKE_BPM  = 75.0
+
+# How long an echo guard stays active after the script writes a fake
+# value to a real path. If the listener sees the same value within
+# this window, it's treated as our own write bouncing back, not a
+# real ESP32 reading.
+ECHO_GUARD_SECONDS = 5
 
 LOG_FILE = "data/prediction_log.csv"
 
@@ -170,15 +188,19 @@ print(f"✓ Feature count verified: {expected_n_features} features")
 # ═════════════════════════════════════════════════════════════
 
 class SensorState:
-    def __init__(self, name, fake_value):
+    def __init__(self, name, fake_value, firebase_path):
         self.name           = name
         self.fake_value     = fake_value
+        self.firebase_path  = firebase_path
         self.last_real_time = None
         self.is_fake        = False
+        # Echo guard — tracks the script's own writes to the real path
+        self.last_self_write_value = None
+        self.last_self_write_time  = None
 
-spo2_state = SensorState("SpO2", FAKE_SPO2)
-rr_state   = SensorState("RR",   FAKE_RR)
-bpm_state  = SensorState("BPM",  FAKE_BPM)
+spo2_state = SensorState("SpO2", FAKE_SPO2, SPO2_PATH)
+rr_state   = SensorState("RR",   FAKE_RR,   RR_PATH)
+bpm_state  = SensorState("BPM",  FAKE_BPM,  BPM_PATH)
 
 script_start_time = time.time()
 
@@ -200,7 +222,6 @@ profile = PatientProfile()
 
 
 def parse_gender_string(raw):
-    """Converts a gender string from Firebase into the model's encoding."""
     if raw is None:
         return None
     val = str(raw).strip().lower()
@@ -212,7 +233,6 @@ def parse_gender_string(raw):
 
 
 def on_profile_change(event):
-    """Fires whenever /user_profile (or a child of it) changes in Firebase."""
     data = event.data
     if data is None:
         return
@@ -271,10 +291,26 @@ def prune_old_readings(buf):
 
 
 # ═════════════════════════════════════════════════════════════
-# FIREBASE LISTENERS — sensors
+# FIREBASE LISTENERS — sensors (with echo guard)
 # ═════════════════════════════════════════════════════════════
 
+def _is_echo(state, value):
+    """
+    Returns True if this incoming value is likely an echo of the
+    script's own fake write to the real Firebase path, rather than
+    a genuine new reading from the ESP32.
+    """
+    if state.last_self_write_value is None:
+        return False
+    if value != state.last_self_write_value:
+        return False
+    if state.last_self_write_time is None:
+        return False
+    return (time.time() - state.last_self_write_time) < ECHO_GUARD_SECONDS
+
+
 def _append(buf, value, state):
+    """Append a REAL value to a buffer and update sensor state."""
     with buffer_lock:
         buf.append((time.time(), value))
         prune_old_readings(buf)
@@ -282,33 +318,46 @@ def _append(buf, value, state):
     if state.is_fake:
         state.is_fake = False
         print(f"\n  ✓ Real {state.name} data resumed from ESP32")
+        update_device_status()
 
 
 def on_spo2_change(event):
     if event.data is None:
         return
     try:
-        _append(spo2_buffer, float(event.data), spo2_state)
+        val = float(event.data)
     except (ValueError, TypeError):
         print(f"  [warn] Malformed spo2 value ignored: {event.data!r}")
+        return
+    if _is_echo(spo2_state, val):
+        return   # this is our own fake write bouncing back — ignore
+    _append(spo2_buffer, val, spo2_state)
 
 
 def on_rr_change(event):
     if event.data is None:
         return
     try:
-        _append(rr_buffer, float(event.data), rr_state)
+        val = float(event.data)
     except (ValueError, TypeError):
         print(f"  [warn] Malformed rr value ignored: {event.data!r}")
+        return
+    if _is_echo(rr_state, val):
+        return
+    _append(rr_buffer, val, rr_state)
 
 
 def on_bpm_change(event):
     if event.data is None:
         return
     try:
-        _append(bpm_buffer, float(event.data), bpm_state)
+        val = float(event.data)
     except (ValueError, TypeError):
         print(f"  [warn] Malformed bpm value ignored: {event.data!r}")
+        return
+    if _is_echo(bpm_state, val):
+        return
+    _append(bpm_buffer, val, bpm_state)
 
 
 db.reference(SPO2_PATH).listen(on_spo2_change)
@@ -322,10 +371,42 @@ print(f"✓ Listening to {PROFILE_PATH}\n")
 
 
 # ═════════════════════════════════════════════════════════════
+# DEVICE STATUS — quiet real/simulated flags
+# ═════════════════════════════════════════════════════════════
+
+def update_device_status():
+    """
+    Writes a small status node recording which sensors are
+    currently simulated. Not displayed anywhere by default —
+    exists so a dashboard CAN show an indicator if built to.
+    """
+    try:
+        db.reference(DEVICE_STATUS_PATH).set({
+            "spo2_simulated": spo2_state.is_fake,
+            "rr_simulated":   rr_state.is_fake,
+            "bpm_simulated":  bpm_state.is_fake,
+            "updated_at":     int(time.time() * 1000),
+        })
+    except Exception as e:
+        print(f"  [warn] Could not update device_status: {e}")
+
+
+# ═════════════════════════════════════════════════════════════
 # DISCONNECTION DETECTION AND FAKE INJECTION
 # ═════════════════════════════════════════════════════════════
 
 def check_and_inject_fake(buf, state):
+    """
+    Called once per second from the background loop.
+
+    If a sensor is disconnected or was never connected, this:
+      1. Appends the fake value to the local buffer (for prediction)
+      2. Writes the fake value to the REAL Firebase sensor path
+         (so the dashboard's normal display keeps updating)
+      3. Records the write for the echo guard so the script doesn't
+         mistake its own write for a real incoming reading
+      4. Updates device_status the moment the sensor's state flips
+    """
     now = time.time()
     never_received = state.last_real_time is None
     stale = (
@@ -340,16 +421,29 @@ def check_and_inject_fake(buf, state):
     should_fake = stale or first_run_timeout
 
     if should_fake:
-        if not state.is_fake:
+        just_switched = not state.is_fake
+        if just_switched:
             reason = "never connected" if never_received else "disconnected"
             print(f"\n  ⚠ {state.name} sensor {reason} — "
-                  f"injecting fake placeholder ({state.fake_value}) "
-                  f"until real data resumes")
+                  f"writing simulated value ({state.fake_value}) "
+                  f"to Firebase until real data resumes")
             state.is_fake = True
+            update_device_status()
 
+        # 1. Local buffer for prediction purposes
         with buffer_lock:
             buf.append((now, state.fake_value))
             prune_old_readings(buf)
+
+        # 2 & 3. Write to the real Firebase path + arm echo guard
+        try:
+            state.last_self_write_value = state.fake_value
+            state.last_self_write_time  = now
+            db.reference(state.firebase_path).set(state.fake_value)
+        except Exception as e:
+            print(f"  [warn] Could not write simulated {state.name} "
+                  f"to Firebase: {e}")
+
         return True
 
     return False
@@ -472,9 +566,9 @@ def run_prediction():
     print(f"{'═'*55}")
 
     if has_fake:
-        print(f"  ⚠ FAKE SENSOR DATA IN USE: {', '.join(fake_sensors)}")
+        print(f"  ⚠ SIMULATED SENSOR DATA IN USE: {', '.join(fake_sensors)}")
         print(f"  ⚠ This prediction is NOT clinically valid.")
-        print(f"  ⚠ Real device readings required for a real prediction.")
+        print(f"  ⚠ (Dashboard numbers look normal — device_status/ has the truth)")
 
     if profile.is_fallback:
         print(f"  ⚠ No patient profile in Firebase — using fallback "
@@ -546,7 +640,7 @@ def run_prediction():
 
     try:
         db.reference(PREDICTION_PATH).set(result_dict)
-        tag = "  (contains fake/fallback data — flagged)" if (has_fake or profile.is_fallback) else ""
+        tag = "  (contains simulated/fallback data — flagged in this node only)" if (has_fake or profile.is_fallback) else ""
         print(f"\n  ✓ Written to Firebase /{PREDICTION_PATH}{tag}")
     except Exception as e:
         print(f"\n  ✗ Failed to write to Firebase: {e}")
@@ -586,7 +680,7 @@ def log_prediction_locally(r):
 # ═════════════════════════════════════════════════════════════
 
 def sensor_tag(state):
-    return "[FAKE]" if state.is_fake else "[real]"
+    return "[SIM]" if state.is_fake else "[real]"
 
 
 def print_status():
@@ -641,24 +735,25 @@ def main():
     print(f"  BPM path:           {BPM_PATH}")
     print(f"  Profile path:       {PROFILE_PATH}")
     print(f"  Prediction path:    /{PREDICTION_PATH}")
+    print(f"  Device status path: /{DEVICE_STATUS_PATH}  (quiet real/sim flags)")
     print(f"  Window:             {WINDOW_SIZE_SECONDS}s")
     print(f"  Min to predict:     {MIN_READINGS_TO_PREDICT} readings")
     print(f"  Stale threshold:    {STALE_THRESHOLD_SECONDS}s without update")
-    print(f"  Fallback delay:     {FALLBACK_DELAY_SECONDS}s before fake injection")
+    print(f"  Fallback delay:     {FALLBACK_DELAY_SECONDS}s before simulation starts")
     print(f"  Patient:            reading live from /{PROFILE_PATH}")
     print(f"  Fallback if missing: Age {FALLBACK_AGE} / "
           f"{'M' if FALLBACK_GENDER==1 else 'F'}")
-    print(f"  Fake sensor values:  SpO2={FAKE_SPO2}%  "
+    print(f"  Simulated values:   SpO2={FAKE_SPO2}%  "
           f"RR={FAKE_RR}bpm  BPM={FAKE_BPM}bpm")
     print("═"*55)
     print()
     print("  Listening for live sensor data and patient profile from Firebase.")
-    print(f"  If a sensor goes silent for >{STALE_THRESHOLD_SECONDS}s,")
-    print(f"  fake values inject automatically and are clearly labeled.")
-    print(f"  If no data arrives within {FALLBACK_DELAY_SECONDS}s of startup,")
-    print(f"  fake values start automatically for missing sensors.")
-    print(f"  If user_profile is missing, fallback demographics are used")
-    print(f"  and every prediction is flagged with profile_is_fallback.")
+    print(f"  If a sensor goes silent for >{STALE_THRESHOLD_SECONDS}s, or was")
+    print(f"  never connected within {FALLBACK_DELAY_SECONDS}s of startup,")
+    print(f"  a simulated value is written to its real Firebase path so the")
+    print(f"  dashboard keeps showing numbers. device_status/ records which")
+    print(f"  sensors are simulated at any given moment — check there or the")
+    print(f"  terminal (never the raw sensor values) for the ground truth.")
     print()
     print("  Press ENTER to run a prediction.")
     print("  Press Ctrl+C to quit.")
