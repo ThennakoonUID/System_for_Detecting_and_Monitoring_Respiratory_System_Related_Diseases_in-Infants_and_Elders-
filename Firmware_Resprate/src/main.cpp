@@ -8,11 +8,11 @@
 // =============================================================
 //  WIFI & FIREBASE CONFIGURATION
 // =============================================================
-#define WIFI_SSID "Induwara's Pixel 9a"
-#define WIFI_PASSWORD "indu17765"
+#define WIFI_SSID "Your WiFi SSID"
+#define WIFI_PASSWORD "Your WiFi Password"
 
 #define FIREBASE_HOST "respiratory-system-monitor-default-rtdb.firebaseio.com"
-#define FIREBASE_AUTH "AIzaSyAhwJpInIiR7JNX8jqS7Z6JTczntVLBF78"
+#define FIREBASE_AUTH "Firebase Database Secret or API Key"
 
 FirebaseData fbdo;
 FirebaseAuth auth;
@@ -52,6 +52,40 @@ TaskHandle_t FirebaseTaskHandle;
 
 #define WIFI_RECONNECT_INTERVAL_MS 5000
 #define FIREBASE_RETRY_INTERVAL_MS 3000
+
+// How often the status fields (state, progress %, uptime, etc.) get pushed
+// to Firebase. Kept separate from the 2s rate/motion upload cadence since
+// status changes less often and we don't want to spam the DB.
+#define STATUS_UPLOAD_INTERVAL_MS 2000
+
+// =============================================================
+//  SYSTEM STATUS TRACKING (for Firebase progress reporting)
+// =============================================================
+enum SystemState {
+  STATE_BOOTING,           // setup() running
+  STATE_WIFI_CONNECTING,   // waiting for WiFi
+  STATE_SENSOR_INIT,       // initializing BMI160s
+  STATE_SENSOR_FAILED,     // sensor init failed, retrying in background
+  STATE_GATHERING_WINDOW,  // running, peak-detection buffer still filling
+  STATE_RUNNING,           // fully operational, RR values valid
+  STATE_MOTION_GATED       // running but currently motion-gated
+};
+
+const char* stateToString(SystemState s) {
+  switch (s) {
+    case STATE_BOOTING:          return "booting";
+    case STATE_WIFI_CONNECTING:  return "wifi_connecting";
+    case STATE_SENSOR_INIT:      return "sensor_init";
+    case STATE_SENSOR_FAILED:    return "sensor_failed";
+    case STATE_GATHERING_WINDOW: return "gathering_window";
+    case STATE_RUNNING:          return "running";
+    case STATE_MOTION_GATED:     return "motion_gated";
+    default:                     return "unknown";
+  }
+}
+
+volatile SystemState systemState = STATE_BOOTING;
+volatile int windowProgressPercent = 0; // 0-100, how full the RR peak-detection buffer is
 
 // =============================================================
 //  BIQUAD STRUCT (Base element for filters)
@@ -317,6 +351,8 @@ void maintainWifi() {
 // =============================================================
 void firebaseUploadTask(void *pvParameters) {
   esp_task_wdt_add(NULL); // register this task with the watchdog
+  unsigned long lastStatusUpload = 0;
+
   for (;;) {
     esp_task_wdt_reset();
 
@@ -335,6 +371,31 @@ void firebaseUploadTask(void *pvParameters) {
       if (!ok2) {
         Serial.print("[Firebase] setBool failed: ");
         Serial.println(fbdo.errorReason());
+      }
+
+      // Status/progress fields — uploaded less frequently since they
+      // change slower than rate/motion, to keep this loop iteration short.
+      unsigned long now = millis();
+      if (now - lastStatusUpload >= STATUS_UPLOAD_INTERVAL_MS) {
+        lastStatusUpload = now;
+
+        Firebase.setString(fbdo, "/respiratory_data/status/state", stateToString(systemState));
+        esp_task_wdt_reset();
+
+        Firebase.setInt(fbdo, "/respiratory_data/status/window_progress_percent", windowProgressPercent);
+        esp_task_wdt_reset();
+
+        Firebase.setBool(fbdo, "/respiratory_data/status/wifi_connected", WiFi.status() == WL_CONNECTED);
+        esp_task_wdt_reset();
+
+        Firebase.setBool(fbdo, "/respiratory_data/status/sensors_ready", bmiReady);
+        esp_task_wdt_reset();
+
+        Firebase.setInt(fbdo, "/respiratory_data/status/uptime_seconds", (int)(millis() / 1000));
+        esp_task_wdt_reset();
+
+        Firebase.setInt(fbdo, "/respiratory_data/status/wifi_rssi", WiFi.status() == WL_CONNECTED ? WiFi.RSSI() : 0);
+        esp_task_wdt_reset();
       }
     }
 
@@ -409,6 +470,17 @@ void updateBMI160() {
     if (rr > 0) respiratoryRate = rr;
   }
 
+  // ── Status tracking for Firebase progress reporting ──
+  if (motionGated) {
+    systemState = STATE_MOTION_GATED;
+  } else if (!pdRR.full) {
+    systemState = STATE_GATHERING_WINDOW;
+    windowProgressPercent = (pdRR.samplesSinceUpdate * 100) / PeakDetectionRR::BUF_LEN;
+  } else {
+    systemState = STATE_RUNNING;
+    windowProgressPercent = 100;
+  }
+
 #if ENABLE_TELEPLOT
   Serial.print(">SigFused_mg:");  Serial.println(sig, 2);
   Serial.print(">Motion_mg:");    Serial.println(motionMag, 1);
@@ -420,7 +492,13 @@ void updateBMI160() {
 void printStatus() {
   if (millis() - lastPrint < PRINT_INTERVAL) return;
   lastPrint = millis();
-  
+
+  Serial.print("State=");
+  Serial.print(stateToString(systemState));
+  Serial.print(" Progress=");
+  Serial.print(windowProgressPercent);
+  Serial.println("%");
+
   Serial.print("RespRate=");
   if (!pdRR.full) {
     int percent = (pdRR.samplesSinceUpdate * 100) / PeakDetectionRR::BUF_LEN;
@@ -439,6 +517,7 @@ void setup() {
   Serial.begin(115200);
   delay(1500); // let power rails stabilize before WiFi radio init (helps with brownout on marginal supplies)
   Serial.println("\nBooting Standalone System...");
+  systemState = STATE_BOOTING;
 
   // Configure watchdog for the whole app. 20s gives headroom for a slow
   // Firebase/SSL call (bounded to ~4s read timeout, see setup() below)
@@ -446,6 +525,7 @@ void setup() {
   esp_task_wdt_init(20, true);
 
   // 1. Initialize Wi-Fi (event-driven, non-blocking after this point)
+  systemState = STATE_WIFI_CONNECTING;
   WiFi.onEvent(onWifiEvent);
   WiFi.mode(WIFI_STA);
   WiFi.setAutoReconnect(true);
@@ -501,6 +581,7 @@ void setup() {
     0);                   
 
   // 4. Initialize Sensors
+  systemState = STATE_SENSOR_INIT;
   Wire.begin(I2C_SDA, I2C_SCL);
   Wire.setClock(400000);
 
@@ -520,8 +601,10 @@ void setup() {
     // Don't hard-lock the MCU (while(1)) — that made the whole board
     // unrecoverable without a manual reset. Instead keep WiFi/Firebase
     // alive and keep retrying sensor init in the background.
+    systemState = STATE_SENSOR_FAILED;
     Serial.println("Sensors not ready — will retry periodically in loop().");
   } else {
+    systemState = STATE_GATHERING_WINDOW;
     Serial.println("System Processing Running Standalone.");
   }
 }
@@ -537,6 +620,7 @@ void loop() {
   if (bmiReady) {
     updateBMI160();
   } else {
+    systemState = STATE_SENSOR_FAILED;
     // Retry sensor init every 5s without blocking WiFi/Firebase
     unsigned long now = millis();
     if (now - lastSensorRetry > 5000) {
@@ -547,7 +631,10 @@ void loop() {
                 (bmi_back.softReset() == BMI160_OK) &&
                 (bmi_back.I2cInit(ADDR_BACK) == BMI160_OK);
       bmiReady = ok;
-      if (ok) Serial.println("Sensors recovered.");
+      if (ok) {
+        Serial.println("Sensors recovered.");
+        systemState = STATE_GATHERING_WINDOW;
+      }
     }
   }
 
