@@ -12,22 +12,30 @@ Firebase tree this script reads from:
   respiratory_data/
     rate:       respiratory rate (breaths per minute)
     motion_gated: bool (read but not used in model)
+  user_profile/
+    age:        patient age, entered via web dashboard
+    gender:     "Male" / "Female" / other, entered via web dashboard
+    name:       patient name, entered via web dashboard
 
 Prediction output is written to:
   prediction/   (top-level node, written after every manual ENTER)
 
 How it works:
-  - Listens to all three sensor paths in real time
-  - Builds a 5-minute rolling buffer on your Mac for each signal
+  - Listens to all three sensor paths AND the user_profile path in real time
+  - Builds a 5-minute rolling buffer on your Mac for each sensor signal
   - If a sensor stops updating (ESP32 disconnected), fake placeholder
     values are injected automatically, clearly labeled
-  - If no real data arrives within FALLBACK_DELAY_SECONDS of startup,
-    fake placeholders kick in for all missing sensors automatically
+  - If no real sensor data arrives within FALLBACK_DELAY_SECONDS of
+    startup, fake placeholders kick in for all missing sensors
+  - Patient age/gender are read live from Firebase user_profile.
+    If missing, fallback demographic values are used and the
+    prediction result is flagged with profile_is_fallback = true
   - Press ENTER at any time to run a prediction once 60s of data exists
   - Ctrl+C to quit
 
 Important: This script must stay running continuously to maintain
-the 5-minute window. Closing it clears all buffers.
+the 5-minute window. Closing it clears all buffers (profile data
+is re-fetched fresh from Firebase on next startup).
 ─────────────────────────────────────────────────────────────────
 """
 
@@ -52,45 +60,28 @@ KEY_PATH     = "firebase_key.json"
 DATABASE_URL = "https://respiratory-system-monitor-default-rtdb.firebaseio.com"
 MODEL_PATH   = "data/respiratory_risk_model.pkl"
 
-# ── Firebase paths (confirmed from console screenshot) ────────
-SPO2_PATH = "biomedical_data/spo2"
-BPM_PATH  = "biomedical_data/bpm"
-RR_PATH   = "respiratory_data/rate"
+SPO2_PATH    = "biomedical_data/spo2"
+BPM_PATH     = "biomedical_data/bpm"
+RR_PATH      = "respiratory_data/rate"
+PROFILE_PATH = "user_profile"
 
-# ── Prediction output path ────────────────────────────────────
 PREDICTION_PATH = "prediction"
 
-# ── Patient demographics ──────────────────────────────────────
-PATIENT_AGE    = 25   # age of the person wearing the device
-PATIENT_GENDER = 1    # 1 = Male, 0 = Female, -1 = Unknown
+FALLBACK_AGE    = 25
+FALLBACK_GENDER = 1   # 1 = Male, 0 = Female, -1 = Unknown
 
-# ── Buffering and prediction thresholds ──────────────────────
-WINDOW_SIZE_SECONDS    = 300   # 5 minutes — matches model training window
-MIN_READINGS_TO_PREDICT = 60   # need at least 60s of data before predicting
+WINDOW_SIZE_SECONDS    = 300
+MIN_READINGS_TO_PREDICT = 60
 
-# ── Disconnection / stale detection ──────────────────────────
-# If a sensor hasn't sent a NEW value in this many seconds,
-# we treat it as disconnected and inject fake placeholders instead.
 STALE_THRESHOLD_SECONDS = 10
-
-# ── First-run fallback ────────────────────────────────────────
-# If a sensor has received NO real data at all within this many
-# seconds of startup, we assume the ESP32 is not connected and
-# start injecting fake placeholders automatically.
 FALLBACK_DELAY_SECONDS = 15
 
-# ── Fake placeholder values (injected when disconnected) ──────
-# These are clinically "normal" values so the model doesn't
-# produce misleading high-risk results purely from fake data.
-# They are clearly labeled everywhere they appear.
-FAKE_SPO2 = 97.0    # % — healthy baseline
-FAKE_RR   = 16.0    # breaths/min — healthy baseline
-FAKE_BPM  = 75.0    # beats/min — healthy baseline
+FAKE_SPO2 = 97.0
+FAKE_RR   = 16.0
+FAKE_BPM  = 75.0
 
-# ── Local log ─────────────────────────────────────────────────
 LOG_FILE = "data/prediction_log.csv"
 
-# ── Feature order — must match Notebook 3 exactly ─────────────
 FEATURE_ORDER = [
     "spo2_mean", "spo2_min", "spo2_std", "spo2_median",
     "spo2_pct_below_95", "spo2_pct_below_92",
@@ -111,8 +102,8 @@ def startup_checks():
     if not os.path.exists(KEY_PATH):
         errors.append(
             f"Firebase key not found at '{KEY_PATH}'.\n"
-            f"     Download from Firebase Console → Project Settings → "
-            f"Service Accounts → Generate new private key."
+            f"     Download from Firebase Console > Project Settings > "
+            f"Service Accounts > Generate new private key."
         )
 
     if "YOUR-PROJECT-ID" in DATABASE_URL:
@@ -177,18 +168,13 @@ print(f"✓ Feature count verified: {expected_n_features} features")
 # ═════════════════════════════════════════════════════════════
 # SENSOR STATE TRACKING
 # ═════════════════════════════════════════════════════════════
-# For each sensor we track:
-#   last_real_time  — Mac timestamp of the last REAL value received
-#                     None means no real reading has ever arrived
-#   is_fake         — True if we are currently injecting fake values
-#                     for this sensor
 
 class SensorState:
     def __init__(self, name, fake_value):
         self.name           = name
         self.fake_value     = fake_value
-        self.last_real_time = None   # None = never received a real value
-        self.is_fake        = False  # True = currently using fake data
+        self.last_real_time = None
+        self.is_fake        = False
 
 spo2_state = SensorState("SpO2", FAKE_SPO2)
 rr_state   = SensorState("RR",   FAKE_RR)
@@ -198,11 +184,78 @@ script_start_time = time.time()
 
 
 # ═════════════════════════════════════════════════════════════
+# PATIENT PROFILE TRACKING
+# ═════════════════════════════════════════════════════════════
+
+class PatientProfile:
+    """Tracks the live patient profile read from Firebase user_profile."""
+    def __init__(self):
+        self.age          = None
+        self.gender       = None
+        self.name         = None
+        self.last_updated = None
+        self.is_fallback  = True
+
+profile = PatientProfile()
+
+
+def parse_gender_string(raw):
+    """Converts a gender string from Firebase into the model's encoding."""
+    if raw is None:
+        return None
+    val = str(raw).strip().lower()
+    if val in ("male", "m"):
+        return 1
+    if val in ("female", "f"):
+        return 0
+    return -1
+
+
+def on_profile_change(event):
+    """Fires whenever /user_profile (or a child of it) changes in Firebase."""
+    data = event.data
+    if data is None:
+        return
+
+    if isinstance(data, dict):
+        if "age" in data:
+            try:
+                profile.age = int(data["age"])
+            except (ValueError, TypeError):
+                print(f"  [warn] Invalid age in user_profile: {data['age']!r}")
+        if "gender" in data:
+            parsed = parse_gender_string(data["gender"])
+            if parsed is not None:
+                profile.gender = parsed
+        if "name" in data:
+            profile.name = data["name"]
+    elif event.path == "/age":
+        try:
+            profile.age = int(data)
+        except (ValueError, TypeError):
+            print(f"  [warn] Invalid age in user_profile: {data!r}")
+    elif event.path == "/gender":
+        parsed = parse_gender_string(data)
+        if parsed is not None:
+            profile.gender = parsed
+    elif event.path == "/name":
+        profile.name = data
+
+    if profile.age is not None and profile.gender is not None:
+        if profile.is_fallback:
+            gender_label = ("M" if profile.gender == 1
+                             else "F" if profile.gender == 0
+                             else "unknown")
+            print(f"\n  ✓ Real patient profile loaded: "
+                  f"{profile.name or 'unnamed'}, age {profile.age}, "
+                  f"gender {gender_label}")
+        profile.is_fallback = False
+        profile.last_updated = time.time()
+
+
+# ═════════════════════════════════════════════════════════════
 # ROLLING BUFFERS
 # ═════════════════════════════════════════════════════════════
-# Each buffer stores (mac_timestamp, value) pairs.
-# Pruning is by actual elapsed time, not reading count,
-# so irregular update rates don't corrupt the window.
 
 spo2_buffer = collections.deque()
 rr_buffer   = collections.deque()
@@ -212,18 +265,16 @@ buffer_lock = threading.Lock()
 
 
 def prune_old_readings(buf):
-    """Drop readings older than WINDOW_SIZE_SECONDS."""
     cutoff = time.time() - WINDOW_SIZE_SECONDS
     while buf and buf[0][0] < cutoff:
         buf.popleft()
 
 
 # ═════════════════════════════════════════════════════════════
-# FIREBASE LISTENERS
+# FIREBASE LISTENERS — sensors
 # ═════════════════════════════════════════════════════════════
 
 def _append(buf, value, state):
-    """Append a real value to a buffer and update sensor state."""
     with buffer_lock:
         buf.append((time.time(), value))
         prune_old_readings(buf)
@@ -263,9 +314,11 @@ def on_bpm_change(event):
 db.reference(SPO2_PATH).listen(on_spo2_change)
 db.reference(RR_PATH).listen(on_rr_change)
 db.reference(BPM_PATH).listen(on_bpm_change)
+db.reference(PROFILE_PATH).listen(on_profile_change)
 print(f"✓ Listening to {SPO2_PATH}")
 print(f"✓ Listening to {RR_PATH}")
-print(f"✓ Listening to {BPM_PATH}\n")
+print(f"✓ Listening to {BPM_PATH}")
+print(f"✓ Listening to {PROFILE_PATH}\n")
 
 
 # ═════════════════════════════════════════════════════════════
@@ -273,18 +326,6 @@ print(f"✓ Listening to {BPM_PATH}\n")
 # ═════════════════════════════════════════════════════════════
 
 def check_and_inject_fake(buf, state):
-    """
-    Called once per second from the background loop.
-    Determines whether a sensor is disconnected or stale,
-    and if so injects a fake placeholder reading.
-
-    A sensor is considered disconnected / stale if:
-      - It has NEVER sent a real value AND FALLBACK_DELAY_SECONDS
-        have passed since the script started, OR
-      - It last sent a real value more than STALE_THRESHOLD_SECONDS ago
-
-    Returns True if a fake value was injected this tick.
-    """
     now = time.time()
     never_received = state.last_real_time is None
     stale = (
@@ -300,7 +341,6 @@ def check_and_inject_fake(buf, state):
 
     if should_fake:
         if not state.is_fake:
-            # First tick we switch to fake — announce it
             reason = "never connected" if never_received else "disconnected"
             print(f"\n  ⚠ {state.name} sensor {reason} — "
                   f"injecting fake placeholder ({state.fake_value}) "
@@ -320,18 +360,6 @@ def check_and_inject_fake(buf, state):
 # ═════════════════════════════════════════════════════════════
 
 def extract_features():
-    """
-    Reads current buffer state, applies physiological sanity
-    filtering, and computes the 17 features the model was
-    trained on.
-
-    Returns: (X, n_spo2, n_rr, warnings, fake_sensors)
-      X            — numpy array shape (1, 17), ready for model.predict()
-      n_spo2       — number of valid SpO2 readings used
-      n_rr         — number of valid RR readings used
-      warnings     — list of warning strings to display
-      fake_sensors — list of sensor names currently using fake data
-    """
     with buffer_lock:
         prune_old_readings(spo2_buffer)
         prune_old_readings(rr_buffer)
@@ -350,7 +378,6 @@ def extract_features():
     if bpm_state.is_fake:
         fake_sensors.append("BPM/HR")
 
-    # ── Minimum data check ──
     if len(spo2_vals) < MIN_READINGS_TO_PREDICT:
         return None, len(spo2_vals), len(rr_vals), \
             [f"Only {len(spo2_vals)} SpO2 readings buffered "
@@ -361,7 +388,6 @@ def extract_features():
             [f"Only {len(rr_vals)} RR readings buffered "
              f"(need {MIN_READINGS_TO_PREDICT})."], fake_sensors
 
-    # ── Physiological sanity filtering ──
     spo2 = np.array(spo2_vals, dtype=float)
     rr   = np.array(rr_vals,   dtype=float)
     bpm  = np.array(bpm_vals,  dtype=float) if bpm_vals else np.array([FAKE_BPM])
@@ -388,11 +414,25 @@ def extract_features():
             "sensor may be malfunctioning."
         )
 
-    # ── Use BPM if available, else fall back to training-set mean ──
     hr_mean = float(np.mean(bpm_clean)) if len(bpm_clean) > 0 else 85.0
     hr_std  = float(np.std(bpm_clean))  if len(bpm_clean) > 1 else 5.0
     if len(bpm_clean) == 0:
         warnings.append("No valid BPM readings — using training-set mean (85 bpm)")
+
+    if profile.age is not None:
+        age_to_use = profile.age
+    else:
+        age_to_use = FALLBACK_AGE
+        warnings.append(f"No age in user_profile — using fallback ({FALLBACK_AGE})")
+
+    if profile.gender is not None:
+        gender_to_use = profile.gender
+    else:
+        gender_to_use = FALLBACK_GENDER
+        warnings.append(
+            f"No gender in user_profile — using fallback "
+            f"({'M' if FALLBACK_GENDER == 1 else 'F'})"
+        )
 
     features = {
         "spo2_mean":         np.mean(spo2_clean),
@@ -410,8 +450,8 @@ def extract_features():
         "rr_pct_above_25":   np.mean(rr_clean > 25) * 100,
         "hr_mean":           hr_mean,
         "hr_std":            hr_std,
-        "age":               float(PATIENT_AGE),
-        "gender":            float(PATIENT_GENDER),
+        "age":               float(age_to_use),
+        "gender":            float(gender_to_use),
     }
 
     X = np.array([[features[col] for col in FEATURE_ORDER]])
@@ -423,14 +463,7 @@ def extract_features():
 # ═════════════════════════════════════════════════════════════
 
 def run_prediction():
-    result = extract_features()
-
-    # extract_features returns 5 values when successful, 4 when not ready
-    if len(result) == 4:
-        _, n_spo2, n_rr, warnings = result
-        fake_sensors = []
-    else:
-        X, n_spo2, n_rr, warnings, fake_sensors = result
+    X, n_spo2, n_rr, warnings, fake_sensors = extract_features()
 
     has_fake = len(fake_sensors) > 0
 
@@ -439,12 +472,16 @@ def run_prediction():
     print(f"{'═'*55}")
 
     if has_fake:
-        print(f"  ⚠ FAKE DATA IN USE: {', '.join(fake_sensors)}")
+        print(f"  ⚠ FAKE SENSOR DATA IN USE: {', '.join(fake_sensors)}")
         print(f"  ⚠ This prediction is NOT clinically valid.")
         print(f"  ⚠ Real device readings required for a real prediction.")
 
-    # X is None if not enough data
-    if 'X' not in dir() or X is None:
+    if profile.is_fallback:
+        print(f"  ⚠ No patient profile in Firebase — using fallback "
+              f"demographics (age {FALLBACK_AGE}, "
+              f"{'M' if FALLBACK_GENDER==1 else 'F'})")
+
+    if X is None:
         print(f"\n  ✗ Cannot predict yet:")
         for w in warnings:
             print(f"    - {w}")
@@ -458,35 +495,47 @@ def run_prediction():
     probability = float(model.predict_proba(X)[0][1]) * 100
     risk_label  = "AT RISK" if prediction == 1 else "NOT AT RISK"
 
-    # ── Collect per-sensor source labels for transparency ──
     spo2_source = "FAKE" if spo2_state.is_fake else "real"
     rr_source   = "FAKE" if rr_state.is_fake   else "real"
     bpm_source  = "FAKE" if bpm_state.is_fake  else "real"
 
+    patient_gender_label = (
+        "Male" if X[0][16] == 1
+        else "Female" if X[0][16] == 0
+        else "Unknown"
+    )
+
     result_dict = {
-        "prediction":        prediction,
-        "risk_label":        risk_label,
-        "risk_probability":  round(probability, 1),
-        "spo2_mean":         round(float(X[0][0]), 1),
-        "spo2_min":          round(float(X[0][1]), 1),
-        "rr_mean":           round(float(X[0][6]), 1),
-        "rr_max":            round(float(X[0][7]), 1),
-        "hr_mean":           round(float(X[0][13]), 1),
-        "spo2_readings":     n_spo2,
-        "rr_readings":       n_rr,
-        "window_seconds":    WINDOW_SIZE_SECONDS,
-        "timestamp":         int(time.time() * 1000),
-        "source":            "local_predict.py (manual)",
-        "has_fake_data":     has_fake,
-        "fake_sensors":      fake_sensors,
-        "spo2_source":       spo2_source,
-        "rr_source":         rr_source,
-        "bpm_source":        bpm_source,
+        "prediction":          prediction,
+        "risk_label":          risk_label,
+        "risk_probability":    round(probability, 1),
+        "spo2_mean":           round(float(X[0][0]), 1),
+        "spo2_min":            round(float(X[0][1]), 1),
+        "rr_mean":             round(float(X[0][6]), 1),
+        "rr_max":              round(float(X[0][7]), 1),
+        "hr_mean":             round(float(X[0][13]), 1),
+        "patient_age":         round(float(X[0][15]), 0),
+        "patient_gender":      patient_gender_label,
+        "patient_name":        profile.name or "Unknown",
+        "profile_is_fallback": profile.is_fallback,
+        "spo2_readings":       n_spo2,
+        "rr_readings":         n_rr,
+        "window_seconds":      WINDOW_SIZE_SECONDS,
+        "timestamp":           int(time.time() * 1000),
+        "source":              "local_predict.py (manual)",
+        "has_fake_data":       has_fake,
+        "fake_sensors":        fake_sensors,
+        "spo2_source":         spo2_source,
+        "rr_source":           rr_source,
+        "bpm_source":          bpm_source,
     }
 
-    # ── Terminal output ──
     print(f"\n  RESULT:    {risk_label}")
     print(f"  Risk prob: {probability:.1f}%")
+    print(f"  Patient:   {result_dict['patient_name']}, "
+          f"age {int(result_dict['patient_age'])}, "
+          f"{result_dict['patient_gender']}"
+          f"{'  [FALLBACK]' if profile.is_fallback else ''}")
     print(f"  SpO2 mean: {result_dict['spo2_mean']}%  "
           f"(min: {result_dict['spo2_min']}%)  [{spo2_source}]")
     print(f"  RR mean:   {result_dict['rr_mean']} bpm  "
@@ -495,16 +544,14 @@ def run_prediction():
     print(f"  SpO2 readings used: {n_spo2}")
     print(f"  RR readings used:   {n_rr}")
 
-    # ── Write to Firebase ──
     try:
         db.reference(PREDICTION_PATH).set(result_dict)
-        tag = "  (contains fake data — flagged)" if has_fake else ""
+        tag = "  (contains fake/fallback data — flagged)" if (has_fake or profile.is_fallback) else ""
         print(f"\n  ✓ Written to Firebase /{PREDICTION_PATH}{tag}")
     except Exception as e:
         print(f"\n  ✗ Failed to write to Firebase: {e}")
         print(f"    Prediction was still logged locally.")
 
-    # ── Write to local log ──
     log_prediction_locally(result_dict)
 
     print(f"{'═'*55}\n")
@@ -512,13 +559,13 @@ def run_prediction():
 
 
 def log_prediction_locally(r):
-    """Append every prediction to a local CSV for permanent local history."""
     file_exists = os.path.exists(LOG_FILE)
     with open(LOG_FILE, "a") as f:
         if not file_exists:
             f.write(
                 "timestamp,datetime,risk_label,risk_probability,"
                 "spo2_mean,spo2_min,rr_mean,rr_max,hr_mean,"
+                "patient_name,patient_age,patient_gender,profile_is_fallback,"
                 "spo2_readings,rr_readings,has_fake_data,fake_sensors\n"
             )
         dt = datetime.fromtimestamp(r["timestamp"] / 1000).isoformat()
@@ -526,7 +573,9 @@ def log_prediction_locally(r):
         f.write(
             f"{r['timestamp']},{dt},{r['risk_label']},{r['risk_probability']},"
             f"{r['spo2_mean']},{r['spo2_min']},{r['rr_mean']},{r['rr_max']},"
-            f"{r['hr_mean']},{r['spo2_readings']},{r['rr_readings']},"
+            f"{r['hr_mean']},{r['patient_name']},{int(r['patient_age'])},"
+            f"{r['patient_gender']},{r['profile_is_fallback']},"
+            f"{r['spo2_readings']},{r['rr_readings']},"
             f"{r['has_fake_data']},{fake_list}\n"
         )
     print(f"  ✓ Logged locally to {LOG_FILE}")
@@ -537,7 +586,6 @@ def log_prediction_locally(r):
 # ═════════════════════════════════════════════════════════════
 
 def sensor_tag(state):
-    """Returns [real] or [FAKE] label for a sensor."""
     return "[FAKE]" if state.is_fake else "[real]"
 
 
@@ -555,11 +603,13 @@ def print_status():
         n_rr   >= MIN_READINGS_TO_PREDICT
     )
     status = "✓ ready — press ENTER to predict" if ready else "buffering..."
+    profile_tag = "[FALLBACK]" if profile.is_fallback else "[real]"
 
     print(
         f"\r  SpO2{sensor_tag(spo2_state)}: {n_spo2:3d}  "
         f"RR{sensor_tag(rr_state)}: {n_rr:3d}  "
         f"BPM{sensor_tag(bpm_state)}: {n_bpm:3d}  "
+        f"Profile{profile_tag}  "
         f"[{status}]   ",
         end="", flush=True
     )
@@ -570,12 +620,6 @@ def print_status():
 # ═════════════════════════════════════════════════════════════
 
 def background_loop():
-    """
-    Runs every second:
-    1. Check each sensor for disconnection / first-run timeout
-    2. Inject fake placeholders if needed
-    3. Refresh the status line
-    """
     while True:
         check_and_inject_fake(spo2_buffer, spo2_state)
         check_and_inject_fake(rr_buffer,   rr_state)
@@ -595,22 +639,26 @@ def main():
     print(f"  SpO2 path:          {SPO2_PATH}")
     print(f"  RR path:            {RR_PATH}")
     print(f"  BPM path:           {BPM_PATH}")
+    print(f"  Profile path:       {PROFILE_PATH}")
     print(f"  Prediction path:    /{PREDICTION_PATH}")
     print(f"  Window:             {WINDOW_SIZE_SECONDS}s")
     print(f"  Min to predict:     {MIN_READINGS_TO_PREDICT} readings")
     print(f"  Stale threshold:    {STALE_THRESHOLD_SECONDS}s without update")
     print(f"  Fallback delay:     {FALLBACK_DELAY_SECONDS}s before fake injection")
-    print(f"  Patient:            Age {PATIENT_AGE} / "
-          f"{'M' if PATIENT_GENDER==1 else 'F' if PATIENT_GENDER==0 else 'Unknown'}")
-    print(f"  Fake placeholders:  SpO2={FAKE_SPO2}%  "
+    print(f"  Patient:            reading live from /{PROFILE_PATH}")
+    print(f"  Fallback if missing: Age {FALLBACK_AGE} / "
+          f"{'M' if FALLBACK_GENDER==1 else 'F'}")
+    print(f"  Fake sensor values:  SpO2={FAKE_SPO2}%  "
           f"RR={FAKE_RR}bpm  BPM={FAKE_BPM}bpm")
     print("═"*55)
     print()
-    print("  Listening for live sensor data from Firebase.")
+    print("  Listening for live sensor data and patient profile from Firebase.")
     print(f"  If a sensor goes silent for >{STALE_THRESHOLD_SECONDS}s,")
     print(f"  fake values inject automatically and are clearly labeled.")
     print(f"  If no data arrives within {FALLBACK_DELAY_SECONDS}s of startup,")
     print(f"  fake values start automatically for missing sensors.")
+    print(f"  If user_profile is missing, fallback demographics are used")
+    print(f"  and every prediction is flagged with profile_is_fallback.")
     print()
     print("  Press ENTER to run a prediction.")
     print("  Press Ctrl+C to quit.")
