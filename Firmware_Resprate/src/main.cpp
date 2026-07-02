@@ -3,19 +3,21 @@
 #include <DFRobot_BMI160.h>
 #include <WiFi.h>
 #include <FirebaseESP32.h>
+#include <esp_task_wdt.h>
 
 // =============================================================
 //  WIFI & FIREBASE CONFIGURATION
 // =============================================================
-#define WIFI_SSID "Isulaaa"
-#define WIFI_PASSWORD "00000000"
+#define WIFI_SSID "Induwara's Pixel 9a"
+#define WIFI_PASSWORD "indu17765"
 
-#define FIREBASE_HOST "https://respiratory-system-monitor-default-rtdb.firebaseio.com/"
+#define FIREBASE_HOST "respiratory-system-monitor-default-rtdb.firebaseio.com"
 #define FIREBASE_AUTH "AIzaSyAhwJpInIiR7JNX8jqS7Z6JTczntVLBF78"
 
 FirebaseData fbdo;
 FirebaseAuth auth;
 FirebaseConfig config;
+TaskHandle_t FirebaseTaskHandle;
 
 // =============================================================
 //  SENSOR CONFIGURATION
@@ -34,6 +36,22 @@ FirebaseConfig config;
 #define MOTION_LOCKOUT_MS 3000
 
 #define PRINT_INTERVAL    1000
+
+// CRITICAL FIX: Turn off 25Hz raw data printing to prevent UART overflow
+// and garbled text while running standalone over WiFi.
+#define ENABLE_TELEPLOT   0 
+
+// =============================================================
+//  POWER / WIFI STABILITY SETTINGS
+// =============================================================
+// If your PCB power rail cannot supply full peak current, lowering
+// TX power reduces current spikes that cause brownout resets.
+// 0 = auto/full power (try this first once hardware power is fixed),
+// or use WIFI_POWER_15dBm / WIFI_POWER_11dBm to cut peak draw.
+#define REDUCE_WIFI_TX_POWER 1
+
+#define WIFI_RECONNECT_INTERVAL_MS 5000
+#define FIREBASE_RETRY_INTERVAL_MS 3000
 
 // =============================================================
 //  BIQUAD STRUCT (Base element for filters)
@@ -109,9 +127,9 @@ struct SavitzkyGolay {
 //  STAGE 2: Time-Domain Peak Detection (Sliding Window)
 // =============================================================
 struct PeakDetectionRR {
-  static const int BUF_LEN      = 750; // 30 seconds at 25 Hz
-  static const int UPDATE_EVERY = 250; // Advance interval: 10 seconds at 25 Hz
-  static const int MIN_DIST     = 20;  // Minimum samples between peaks (Max ~75 BPM)
+  static const int BUF_LEN      = 300; 
+  static const int UPDATE_EVERY = 25; 
+  static const int MIN_DIST     = 20; 
 
   float buf[BUF_LEN] = {};
   int   head = 0;
@@ -249,7 +267,6 @@ PeakDetectionRR pdRR;
 AxisFuser fuser_cx, fuser_cy, fuser_cz;
 AxisFuser fuser_bx, fuser_by, fuser_bz;
 
-// Volatile keyword is used so both processor cores can read/write safely
 volatile float respiratoryRate  = 0.0f;
 volatile bool  motionGated    = false;
 
@@ -257,30 +274,72 @@ unsigned long lastMotionTime = 0;
 unsigned long lastRRSample   = 0;
 unsigned long lastPrint      = 0;
 
-TaskHandle_t FirebaseTaskHandle;
+// WiFi/Firebase state tracking (non-blocking)
+volatile bool wifiWasConnected = false;
+unsigned long lastWifiAttempt = 0;
+bool firebaseConfigured = false;
 
 // =============================================================
-//  CORE 0: FIREBASE UPLOAD TASK (Runs in Background)
+//  WIFI EVENT HANDLER (event-driven, no blocking loops)
+// =============================================================
+void onWifiEvent(WiFiEvent_t event) {
+  switch (event) {
+    case ARDUINO_EVENT_WIFI_STA_CONNECTED:
+      Serial.println("[WiFi] Connected to AP.");
+      break;
+    case ARDUINO_EVENT_WIFI_STA_GOT_IP:
+      Serial.print("[WiFi] Got IP: ");
+      Serial.println(WiFi.localIP());
+      wifiWasConnected = true;
+      break;
+    case ARDUINO_EVENT_WIFI_STA_DISCONNECTED:
+      Serial.println("[WiFi] Disconnected. Will retry in background.");
+      wifiWasConnected = false;
+      break;
+    default:
+      break;
+  }
+}
+
+// Call periodically from loop() — non-blocking reconnect attempt.
+void maintainWifi() {
+  if (WiFi.status() == WL_CONNECTED) return;
+  unsigned long now = millis();
+  if (now - lastWifiAttempt < WIFI_RECONNECT_INTERVAL_MS) return;
+  lastWifiAttempt = now;
+  Serial.println("[WiFi] Attempting reconnect...");
+  WiFi.disconnect();
+  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+}
+
+// =============================================================
+//  CORE 0: FIREBASE UPLOAD TASK (STANDALONE PROOF)
 // =============================================================
 void firebaseUploadTask(void *pvParameters) {
+  esp_task_wdt_add(NULL); // register this task with the watchdog
   for (;;) {
-    // Only upload if WiFi is connected and we actually have a full buffer of data
-    if (WiFi.status() == WL_CONNECTED && pdRR.full) {
-      
-      // Upload Respiratory Rate
-      if (Firebase.setFloat(fbdo, "/respiratory_data/rate", respiratoryRate)) {
-        // Silent success to keep Serial Monitor clean
-      } else {
-        Serial.print(">> Firebase Error: ");
+    esp_task_wdt_reset();
+
+    // Only upload if properly connected and authenticated.
+    // This never blocks the sensor loop on core 1.
+    if (WiFi.status() == WL_CONNECTED && Firebase.ready()) {
+      bool ok1 = Firebase.setFloat(fbdo, "/respiratory_data/rate", respiratoryRate);
+      esp_task_wdt_reset(); // feed the watchdog immediately after this blocking call
+      if (!ok1) {
+        Serial.print("[Firebase] setFloat failed: ");
         Serial.println(fbdo.errorReason());
       }
-      
-      // Upload Motion Status (Optional but helpful for UI)
-      Firebase.setBool(fbdo, "/respiratory_data/motion_gated", motionGated);
+
+      bool ok2 = Firebase.setBool(fbdo, "/respiratory_data/motion_gated", motionGated);
+      esp_task_wdt_reset(); // feed the watchdog immediately after this blocking call
+      if (!ok2) {
+        Serial.print("[Firebase] setBool failed: ");
+        Serial.println(fbdo.errorReason());
+      }
     }
-    
-    // Wait 2000 milliseconds (2 seconds) before running again
-    vTaskDelay(2000 / portTICK_PERIOD_MS);
+
+    // Generous delay prevents WDT crash and network stack overflow
+    vTaskDelay(pdMS_TO_TICKS(2000));
   }
 }
 
@@ -304,9 +363,17 @@ void updateBMI160() {
   float byr = (db[4]/16384.0f) * 1000.0f;
   float bzr = (db[5]/16384.0f) * 1000.0f;
 
-  float bxr_g = bxr/1000.0f; float byr_g = byr/1000.0f;
-  float bzr_g = bzr/1000.0f;
-  float motionMag = fabsf(sqrtf(bxr_g*bxr_g + byr_g*byr_g + bzr_g*bzr_g) - 1.0f) * 1000.0f;
+  float cx_g = cxr/1000.0f; float cy_g = cyr/1000.0f; float cz_g = czr/1000.0f;
+  float bx_g = bxr/1000.0f; float by_g = byr/1000.0f; float bz_g = bzr/1000.0f;
+
+  float magChest = sqrtf(cx_g*cx_g + cy_g*cy_g + cz_g*cz_g);
+  float magBack  = sqrtf(bx_g*bx_g + by_g*by_g + bz_g*bz_g);
+  
+  if (magChest < 0.1f || magBack < 0.1f) return;
+
+  float instMotionChest = fabsf(magChest - 1.0f) * 1000.0f;
+  float instMotionBack  = fabsf(magBack - 1.0f) * 1000.0f;
+  float motionMag = fmaxf(instMotionChest, instMotionBack);
   
   if (motionMag > MOTION_THRESHOLD) {
     motionGated = true; lastMotionTime = now;
@@ -342,18 +409,14 @@ void updateBMI160() {
     if (rr > 0) respiratoryRate = rr;
   }
 
+#if ENABLE_TELEPLOT
   Serial.print(">SigFused_mg:");  Serial.println(sig, 2);
   Serial.print(">Motion_mg:");    Serial.println(motionMag, 1);
   Serial.print(">Gated:");        Serial.println(motionGated ? 10 : 0);
   Serial.print(">RespRate:");     Serial.println(respiratoryRate, 1);
-  
-  float bufferFillPct = pdRR.full ? 100.0f : ((float)pdRR.samplesSinceUpdate / PeakDetectionRR::BUF_LEN) * 100.0f;
-  Serial.print(">BufferFill_%:"); Serial.println(bufferFillPct, 1);
+#endif
 }
 
-// =============================================================
-//  SERIAL STATUS
-// =============================================================
 void printStatus() {
   if (millis() - lastPrint < PRINT_INTERVAL) return;
   lastPrint = millis();
@@ -365,55 +428,128 @@ void printStatus() {
   } else {
     Serial.print(respiratoryRate, 1); Serial.println(" br/min");
   }
+  Serial.print("WiFi=");
+  Serial.println(WiFi.status() == WL_CONNECTED ? "connected" : "DISCONNECTED");
 }
 
+// =============================================================
+//  SETUP
+// =============================================================
 void setup() {
   Serial.begin(115200);
-  delay(1000);
-  Serial.println("Booting...");
-  
-  // 1. Initialize Wi-Fi
+  delay(1500); // let power rails stabilize before WiFi radio init (helps with brownout on marginal supplies)
+  Serial.println("\nBooting Standalone System...");
+
+  // Configure watchdog for the whole app. 20s gives headroom for a slow
+  // Firebase/SSL call (bounded to ~4s read timeout, see setup() below)
+  // plus WiFi reconnect attempts, without masking a genuine hang.
+  esp_task_wdt_init(20, true);
+
+  // 1. Initialize Wi-Fi (event-driven, non-blocking after this point)
+  WiFi.onEvent(onWifiEvent);
+  WiFi.mode(WIFI_STA);
+  WiFi.setAutoReconnect(true);
+  WiFi.persistent(false); // avoid unnecessary flash writes on every connect
+
+#if REDUCE_WIFI_TX_POWER
+  // Lowering TX power reduces peak current draw, which helps a lot if the
+  // 3.3V rail is marginal. Remove/raise this once hardware power is solid.
   WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
-  Serial.print("Connecting to Wi-Fi");
-  while (WiFi.status() != WL_CONNECTED) {
-    delay(500);
+  WiFi.setTxPower(WIFI_POWER_15dBm);
+#else
+  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+#endif
+
+  // Short bounded wait just so first boot has a chance to come up before
+  // we start sensors — but we DO NOT hang forever like the old code did.
+  unsigned long wifiStart = millis();
+  while (WiFi.status() != WL_CONNECTED && millis() - wifiStart < 8000) {
+    delay(250);
     Serial.print(".");
   }
-  Serial.println("\nWi-Fi Connected!");
+  Serial.println();
+  if (WiFi.status() == WL_CONNECTED) {
+    Serial.println("Wi-Fi connected on boot.");
+  } else {
+    Serial.println("Wi-Fi not yet connected — will keep retrying in background.");
+  }
 
   // 2. Initialize Firebase
+  fbdo.setBSSLBufferSize(1024, 512); // CRITICAL FIX: Optimize SSL memory
   config.database_url = FIREBASE_HOST;
   config.signer.tokens.legacy_token = FIREBASE_AUTH;
   Firebase.reconnectWiFi(true);
+
+  // Bound how long a single Firebase call is allowed to block. Without this,
+  // a stalled SSL handshake or slow network can block setFloat()/setBool()
+  // for far longer than the task watchdog timeout and trigger a reboot.
+  fbdo.setResponseSize(1024);
+  Firebase.setReadTimeout(fbdo, 4000);        // ms
+  Firebase.setwriteSizeLimit(fbdo, "tiny");   // small payloads, no need for large limit
+
   Firebase.begin(&config, &auth);
-  
+  firebaseConfigured = true;
+
   // 3. Start Dual Core Task for Firebase Uploads
   xTaskCreatePinnedToCore(
-    firebaseUploadTask,   // Task function
-    "FirebaseTask",       // Name of task
-    8192,                 // Stack size
-    NULL,                 // Parameter
-    1,                    // Priority
-    &FirebaseTaskHandle,  // Task handle
-    0);                   // Pin to Core 0
+    firebaseUploadTask,   
+    "FirebaseTask",       
+    8192,                 
+    NULL,                 
+    1,                    
+    &FirebaseTaskHandle,  
+    0);                   
 
   // 4. Initialize Sensors
   Wire.begin(I2C_SDA, I2C_SCL);
   Wire.setClock(400000);
-  
-  if (bmi_chest.softReset() != BMI160_OK || bmi_chest.I2cInit(ADDR_CHEST) != BMI160_OK) {
-    Serial.println("Abdomen BMI160 FAILED"); while(1) delay(1000);
+
+  bool sensorsOk = true;
+  if (bmi_chest.softReset() != BMI160_OK) { Serial.println("Chest sensor soft reset failed"); sensorsOk = false; }
+  delay(100);
+  if (sensorsOk && bmi_chest.I2cInit(ADDR_CHEST) != BMI160_OK) { Serial.println("Chest sensor init failed"); sensorsOk = false; }
+
+  delay(100);
+
+  if (sensorsOk && bmi_back.softReset() != BMI160_OK) { Serial.println("Back sensor soft reset failed"); sensorsOk = false; }
+  delay(100);
+  if (sensorsOk && bmi_back.I2cInit(ADDR_BACK) != BMI160_OK) { Serial.println("Back sensor init failed"); sensorsOk = false; }
+
+  bmiReady = sensorsOk;
+  if (!bmiReady) {
+    // Don't hard-lock the MCU (while(1)) — that made the whole board
+    // unrecoverable without a manual reset. Instead keep WiFi/Firebase
+    // alive and keep retrying sensor init in the background.
+    Serial.println("Sensors not ready — will retry periodically in loop().");
+  } else {
+    Serial.println("System Processing Running Standalone.");
   }
-  if (bmi_back.softReset() != BMI160_OK || bmi_back.I2cInit(ADDR_BACK) != BMI160_OK) {
-    Serial.println("Back BMI160 FAILED"); while(1) delay(1000);
-  }
-  
-  bmiReady = true;
-  Serial.println("All systems GO. Monitoring 25Hz DSP on Core 1, Uploading to Firebase on Core 0.");
 }
 
+// =============================================================
+//  LOOP
+// =============================================================
+unsigned long lastSensorRetry = 0;
+
 void loop() {
-  // Core 1 (Default Loop): Only handles time-critical sensor math
-  if (bmiReady) updateBMI160();
+  maintainWifi(); // non-blocking reconnect if WiFi dropped
+
+  if (bmiReady) {
+    updateBMI160();
+  } else {
+    // Retry sensor init every 5s without blocking WiFi/Firebase
+    unsigned long now = millis();
+    if (now - lastSensorRetry > 5000) {
+      lastSensorRetry = now;
+      Serial.println("Retrying BMI160 init...");
+      bool ok = (bmi_chest.softReset() == BMI160_OK) &&
+                (bmi_chest.I2cInit(ADDR_CHEST) == BMI160_OK) &&
+                (bmi_back.softReset() == BMI160_OK) &&
+                (bmi_back.I2cInit(ADDR_BACK) == BMI160_OK);
+      bmiReady = ok;
+      if (ok) Serial.println("Sensors recovered.");
+    }
+  }
+
   printStatus();
 }
